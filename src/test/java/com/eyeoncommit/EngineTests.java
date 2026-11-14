@@ -1,97 +1,161 @@
 package com.eyeoncommit;
 
-import com.eyeoncommit.engine.*;
+import com.eyeoncommit.engine.ActivityAnalyzer;
+import com.eyeoncommit.engine.CoChangeAnalyzer;
+import com.eyeoncommit.engine.FrequencyCounter;
+import com.eyeoncommit.engine.TopK;
 import com.eyeoncommit.git.GitRepositoryReader;
 import com.eyeoncommit.model.Commit;
 import java.io.BufferedReader;
 import java.io.StringReader;
-import java.util.*;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 
-/** Dependency-free tests. Run: ./run-tests.sh  (exit code 1 on failure). */
 public class EngineTests {
-    static int failed = 0;
 
-    static Commit c(String email, long ts, String... files) {
-        return new Commit("h", email, email, ts, new LinkedHashSet<>(Arrays.asList(files)));
-    }
-    static void check(String name, boolean ok) {
-        System.out.println((ok ? "PASS " : "FAIL ") + name);
-        if (!ok) failed++;
+    static int failures = 0;
+
+    static Commit makeCommit(String email, long timestamp, String... files) {
+        return new Commit("abc123", email, email, timestamp,
+                new LinkedHashSet<>(Arrays.asList(files)));
     }
 
-    public static void main(String[] a) throws Exception {
-        var commits = List.of(c("a", 1, "X", "Y"), c("b", 2, "X"), c("a", 3, "X", "Z"));
-        var ff = FrequencyCounter.fileFrequency(commits);
-        check("file in multiple commits", ff.get("X") == 3);
-        check("file appears once", ff.get("Y") == 1);
-        check("duplicate in one commit counts once",
-                FrequencyCounter.fileFrequency(List.of(c("a", 1, "X", "X"))).get("X") == 1);
+    static void verify(String testName, boolean passed) {
+        System.out.println((passed ? "PASS " : "FAIL ") + testName);
+        if (!passed) failures++;
+    }
 
-        check("same contributor counted", FrequencyCounter.contributorFrequency(commits).get("a") == 2);
-        check("empty list", FrequencyCounter.fileFrequency(List.of()).isEmpty());
+    public static void main(String[] args) throws Exception {
+        testFrequencyCounter();
+        testTopK();
+        testCoChangeAnalyzer();
+        testActivityAnalyzer();
+        testGitLogParsing();
+        testRepoNameResolution();
+        testLiveRead();
 
-        Map<String, Integer> m = Map.of("a", 5, "b", 5, "c", 9, "d", 1);
-        var top2 = TopK.of(m, 2);
-        check("top-k picks highest", top2.get(0).getKey().equals("c"));
-        check("top-k tie -> alphabetical", top2.get(1).getKey().equals("a"));
-        check("k larger than size", TopK.of(m, 10).size() == 4);
-        check("k zero", TopK.of(m, 0).isEmpty());
-        check("k negative", TopK.of(m, -3).isEmpty());
+        System.out.println(failures == 0
+                ? "\nAll tests passed."
+                : "\n" + failures + " test(s) FAILED.");
+        System.exit(failures == 0 ? 0 : 1);
+    }
 
-        check("0 files -> no pairs", CoChangeAnalyzer.pairs(List.of(c("a", 1)), 50).isEmpty());
-        check("1 file -> no pairs", CoChangeAnalyzer.pairs(List.of(c("a", 1, "A")), 50).isEmpty());
-        check("2 files -> 1 pair", CoChangeAnalyzer.pairs(List.of(c("a", 1, "A", "B")), 50).size() == 1);
-        check("3 files -> 3 pairs", CoChangeAnalyzer.pairs(List.of(c("a", 1, "A", "B", "C")), 50).size() == 3);
-        var canon = CoChangeAnalyzer.pairs(List.of(c("a", 1, "B", "A"), c("a", 2, "A", "B")), 50);
-        check("pair order canonical", canon.size() == 1 && canon.values().iterator().next() == 2);
-        check("large commit skipped", CoChangeAnalyzer.pairs(List.of(c("a", 1, "A", "B", "C")), 2).isEmpty());
-
-        long day = 86400;
-        var act = ActivityAnalyzer.weekly(List.of(c("a", 1731500000L), c("a", 1731500000L + 100),
-                c("a", 1731500000L + 14 * day), c("a", -1), c("a", 0)));
-        check("same day grouped + invalid skipped + different weeks",
-                act.size() == 2 && act.firstEntry().getValue() == 2);
-
-        // GitRepositoryReader tests
-        GitRepositoryReader reader = new GitRepositoryReader();
-        String gitLogSample = String.join("\n",
-                "@@hash1|1731500000|alice@example.com|Alice | Team Lead",
-                "file1.txt",
-                "file2.txt",
-                "@@hash2|1731586400|bob@example.com|Bob",
-                "file2.txt",
-                "@@hash3|1731672800||",
-                "file3.txt"
+    static void testFrequencyCounter() {
+        var sampleCommits = List.of(
+                makeCommit("alice@test.com", 1, "README.md", "Main.java"),
+                makeCommit("bob@test.com", 2, "README.md"),
+                makeCommit("alice@test.com", 3, "README.md", "build.sh")
         );
-        List<Commit> parsedCommits = reader.parse(new BufferedReader(new StringReader(gitLogSample)));
-        check("parse count", parsedCommits.size() == 3);
 
-        Commit c1 = parsedCommits.get(0);
-        check("author with pipe preserved", "Alice | Team Lead".equals(c1.authorName()));
-        check("author with pipe timestamp valid", c1.epochSec() == 1731500000L);
-        check("commit 1 files count", c1.files().size() == 2 && c1.files().contains("file1.txt"));
+        var fileCounts = FrequencyCounter.fileFrequency(sampleCommits);
+        verify("file changed in multiple commits gets correct count", fileCounts.get("README.md") == 3);
+        verify("file changed once has count of 1", fileCounts.get("Main.java") == 1);
 
-        Commit c3 = parsedCommits.get(2);
-        check("blank email falls back to unknown", "unknown".equals(c3.authorEmail()));
-        check("blank name falls back to email", "unknown".equals(c3.authorName()));
+        var duplicateFile = FrequencyCounter.fileFrequency(
+                List.of(makeCommit("alice@test.com", 1, "X.java", "X.java")));
+        verify("duplicate file in same commit only counted once", duplicateFile.get("X.java") == 1);
 
-        check("parse empty input", reader.parse(new BufferedReader(new StringReader(""))).isEmpty());
+        var authorCounts = FrequencyCounter.contributorFrequency(sampleCommits);
+        verify("contributor with two commits counted twice", authorCounts.get("alice@test.com") == 2);
 
-        // ActivityAnalyzer with pipe author commit
-        var pipeAct = ActivityAnalyzer.weekly(List.of(c1));
-        check("activity timeline includes commit with pipe in author", pipeAct.size() == 1);
+        verify("empty commit list gives empty map", FrequencyCounter.fileFrequency(List.of()).isEmpty());
+    }
 
-        // Main repo name resolution
-        String repoNameDot = Main.resolveRepoName(".");
-        check("resolveRepoName for '.' is not '.'", !repoNameDot.equals(".") && !repoNameDot.isEmpty());
-        String repoNameSlash = Main.resolveRepoName("./");
-        check("resolveRepoName for './' is not '.'", !repoNameSlash.equals(".") && !repoNameSlash.isEmpty());
+    static void testTopK() {
+        Map<String, Integer> scores = Map.of("alpha", 5, "beta", 5, "gamma", 9, "delta", 1);
 
-        // Live read of current repository
-        List<Commit> repoCommits = reader.read(".", 5);
-        check("read current git repository", !repoCommits.isEmpty());
+        var top2 = TopK.of(scores, 2);
+        verify("highest value comes first", top2.get(0).getKey().equals("gamma"));
+        verify("ties broken alphabetically", top2.get(1).getKey().equals("alpha"));
 
-        System.out.println(failed == 0 ? "\nAll tests passed." : "\n" + failed + " test(s) FAILED.");
-        System.exit(failed == 0 ? 0 : 1);
+        verify("k bigger than map returns everything", TopK.of(scores, 10).size() == 4);
+        verify("k of zero returns empty", TopK.of(scores, 0).isEmpty());
+        verify("negative k returns empty", TopK.of(scores, -3).isEmpty());
+    }
+
+    static void testCoChangeAnalyzer() {
+        verify("commit with no files produces no pairs",
+                CoChangeAnalyzer.pairs(List.of(makeCommit("x", 1)), 50).isEmpty());
+
+        verify("commit with one file produces no pairs",
+                CoChangeAnalyzer.pairs(List.of(makeCommit("x", 1, "A.java")), 50).isEmpty());
+
+        verify("two files make one pair",
+                CoChangeAnalyzer.pairs(List.of(makeCommit("x", 1, "A.java", "B.java")), 50).size() == 1);
+
+        verify("three files make three pairs",
+                CoChangeAnalyzer.pairs(List.of(makeCommit("x", 1, "A", "B", "C")), 50).size() == 3);
+
+        var bothOrders = CoChangeAnalyzer.pairs(
+                List.of(makeCommit("x", 1, "B", "A"), makeCommit("x", 2, "A", "B")), 50);
+        verify("pair counted regardless of file order",
+                bothOrders.size() == 1 && bothOrders.values().iterator().next() == 2);
+
+        verify("commit exceeding max files gets skipped",
+                CoChangeAnalyzer.pairs(List.of(makeCommit("x", 1, "A", "B", "C")), 2).isEmpty());
+    }
+
+    static void testActivityAnalyzer() {
+        long secondsInDay = 86400;
+        long baseTimestamp = 1731500000L;
+
+        var timeline = ActivityAnalyzer.weekly(List.of(
+                makeCommit("dev", baseTimestamp),
+                makeCommit("dev", baseTimestamp + 100),
+                makeCommit("dev", baseTimestamp + 14 * secondsInDay),
+                makeCommit("dev", -1),
+                makeCommit("dev", 0)
+        ));
+
+        verify("two weeks detected and invalid timestamps skipped",
+                timeline.size() == 2 && timeline.firstEntry().getValue() == 2);
+    }
+
+    static void testGitLogParsing() throws Exception {
+        GitRepositoryReader reader = new GitRepositoryReader();
+
+        String fakeGitLog = String.join("\n",
+                "@@aaa111|1731500000|alice@dev.io|Alice | Team Lead",
+                "src/Main.java",
+                "README.md",
+                "@@bbb222|1731586400|bob@dev.io|Bob",
+                "README.md",
+                "@@ccc333|1731672800||",
+                "config.yml"
+        );
+
+        List<Commit> parsed = reader.parseLogOutput(new BufferedReader(new StringReader(fakeGitLog)));
+        verify("parsed three commits from log", parsed.size() == 3);
+
+        Commit first = parsed.get(0);
+        verify("author name with pipe character preserved", "Alice | Team Lead".equals(first.authorName()));
+        verify("timestamp parsed correctly", first.epochSec() == 1731500000L);
+        verify("files attached to correct commit", first.files().size() == 2 && first.files().contains("src/Main.java"));
+
+        Commit third = parsed.get(2);
+        verify("missing email defaults to unknown", "unknown".equals(third.authorEmail()));
+        verify("missing name falls back to email", "unknown".equals(third.authorName()));
+
+        verify("empty input returns empty list",
+                reader.parseLogOutput(new BufferedReader(new StringReader(""))).isEmpty());
+
+        var weeklyFromParsed = ActivityAnalyzer.weekly(List.of(first));
+        verify("parsed commit works with activity analyzer", weeklyFromParsed.size() == 1);
+    }
+
+    static void testRepoNameResolution() {
+        String dotResult = Main.figureOutRepoName(".");
+        verify("dot path resolves to actual folder name", !dotResult.equals(".") && !dotResult.isEmpty());
+
+        String slashResult = Main.figureOutRepoName("./");
+        verify("dot-slash path resolves to actual folder name", !slashResult.equals(".") && !slashResult.isEmpty());
+    }
+
+    static void testLiveRead() throws Exception {
+        GitRepositoryReader reader = new GitRepositoryReader();
+        List<Commit> liveCommits = reader.read(".", 5);
+        verify("can read commits from current git repo", !liveCommits.isEmpty());
     }
 }

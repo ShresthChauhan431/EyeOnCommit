@@ -1,7 +1,10 @@
 package com.eyeoncommit;
 
 import com.eyeoncommit.engine.*;
+import com.eyeoncommit.git.GitRepositoryReader;
 import com.eyeoncommit.model.Commit;
+import java.io.BufferedReader;
+import java.io.StringReader;
 import java.util.*;
 
 /** Dependency-free tests. Run: ./run-tests.sh  (exit code 1 on failure). */
@@ -16,7 +19,7 @@ public class EngineTests {
         if (!ok) failed++;
     }
 
-    public static void main(String[] a) {
+    public static void main(String[] a) throws Exception {
         var commits = List.of(c("a", 1, "X", "Y"), c("b", 2, "X"), c("a", 3, "X", "Z"));
         var ff = FrequencyCounter.fileFrequency(commits);
         check("file in multiple commits", ff.get("X") == 3);
@@ -48,6 +51,45 @@ public class EngineTests {
                 c("a", 1731500000L + 14 * day), c("a", -1), c("a", 0)));
         check("same day grouped + invalid skipped + different weeks",
                 act.size() == 2 && act.firstEntry().getValue() == 2);
+
+        // GitRepositoryReader tests
+        GitRepositoryReader reader = new GitRepositoryReader();
+        String gitLogSample = String.join("\n",
+                "@@hash1|1731500000|alice@example.com|Alice | Team Lead",
+                "file1.txt",
+                "file2.txt",
+                "@@hash2|1731586400|bob@example.com|Bob",
+                "file2.txt",
+                "@@hash3|1731672800||",
+                "file3.txt"
+        );
+        List<Commit> parsedCommits = reader.parse(new BufferedReader(new StringReader(gitLogSample)));
+        check("parse count", parsedCommits.size() == 3);
+
+        Commit c1 = parsedCommits.get(0);
+        check("author with pipe preserved", "Alice | Team Lead".equals(c1.authorName()));
+        check("author with pipe timestamp valid", c1.epochSec() == 1731500000L);
+        check("commit 1 files count", c1.files().size() == 2 && c1.files().contains("file1.txt"));
+
+        Commit c3 = parsedCommits.get(2);
+        check("blank email falls back to unknown", "unknown".equals(c3.authorEmail()));
+        check("blank name falls back to email", "unknown".equals(c3.authorName()));
+
+        check("parse empty input", reader.parse(new BufferedReader(new StringReader(""))).isEmpty());
+
+        // ActivityAnalyzer with pipe author commit
+        var pipeAct = ActivityAnalyzer.weekly(List.of(c1));
+        check("activity timeline includes commit with pipe in author", pipeAct.size() == 1);
+
+        // Main repo name resolution
+        String repoNameDot = Main.resolveRepoName(".");
+        check("resolveRepoName for '.' is not '.'", !repoNameDot.equals(".") && !repoNameDot.isEmpty());
+        String repoNameSlash = Main.resolveRepoName("./");
+        check("resolveRepoName for './' is not '.'", !repoNameSlash.equals(".") && !repoNameSlash.isEmpty());
+
+        // Live read of current repository
+        List<Commit> repoCommits = reader.read(".", 5);
+        check("read current git repository", !repoCommits.isEmpty());
 
         System.out.println(failed == 0 ? "\nAll tests passed." : "\n" + failed + " test(s) FAILED.");
         System.exit(failed == 0 ? 0 : 1);
